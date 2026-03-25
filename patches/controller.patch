@@ -1,0 +1,733 @@
+diff --git a/Tools/ardupilotwaf/boards.py b/Tools/ardupilotwaf/boards.py
+index b1a54e45e3..7fccdbea82 100644
+--- a/Tools/ardupilotwaf/boards.py
++++ b/Tools/ardupilotwaf/boards.py
+@@ -152,7 +152,8 @@ class Board:
+                 AP_CUSTOMCONTROL_ENABLED=1,
+             )
+             env.AP_LIBRARIES += [
+-                'AC_CustomControl'
++                'AC_CustomControl',
++                'AC_CustomControl_Adaptive'
+             ]
+             cfg.msg("Enabled custom controller", 'yes')
+         else:
+diff --git a/libraries/AC_CustomControl/AC_CustomControl.cpp b/libraries/AC_CustomControl/AC_CustomControl.cpp
+index 407b9db249..e8969ec98b 100644
+--- a/libraries/AC_CustomControl/AC_CustomControl.cpp
++++ b/libraries/AC_CustomControl/AC_CustomControl.cpp
+@@ -5,8 +5,9 @@
+ #if AP_CUSTOMCONTROL_ENABLED
+ 
+ #include "AC_CustomControl_Backend.h"
+-// #include "AC_CustomControl_Empty.h"
++#include "AC_CustomControl_Empty.h"
+ #include "AC_CustomControl_PID.h"
++#include "AC_CustomControl_Adaptive.h"
+ #include <GCS_MAVLink/GCS.h>
+ #include <AP_Logger/AP_Logger.h>
+ 
+@@ -33,6 +34,9 @@ const AP_Param::GroupInfo AC_CustomControl::var_info[] = {
+     // parameters for PID controller
+     AP_SUBGROUPVARPTR(_backend, "2_", 7, AC_CustomControl, _backend_var_info[1]),
+ 
++    // parameters for adaptive controller
++    AP_SUBGROUPVARPTR(_backend, "3_", 8, AC_CustomControl, _backend_var_info[2]),
++
+     AP_GROUPEND
+ };
+ 
+@@ -62,6 +66,10 @@ void AC_CustomControl::init(void)
+             _backend = NEW_NOTHROW AC_CustomControl_PID(*this, _ahrs, _att_control, _motors, _dt);
+             _backend_var_info[get_type()] = AC_CustomControl_PID::var_info;
+             break;
++        case CustomControlType::CONT_ADAPTIVE:
++            _backend = NEW_NOTHROW AC_CustomControl_Adaptive(*this, _ahrs, _att_control, _motors, _dt);
++            _backend_var_info[get_type()] = AC_CustomControl_Adaptive::var_info;
++            break;
+         default:
+             return;
+     }
+diff --git a/libraries/AC_CustomControl/AC_CustomControl.h b/libraries/AC_CustomControl/AC_CustomControl.h
+index 9a12a34706..a219833df0 100644
+--- a/libraries/AC_CustomControl/AC_CustomControl.h
++++ b/libraries/AC_CustomControl/AC_CustomControl.h
+@@ -14,7 +14,7 @@
+ #include <AP_Motors/AP_MotorsMulticopter.h>
+ 
+ #ifndef CUSTOMCONTROL_MAX_TYPES
+-#define CUSTOMCONTROL_MAX_TYPES 2
++#define CUSTOMCONTROL_MAX_TYPES 3
+ #endif
+ 
+ class AC_CustomControl_Backend;
+@@ -49,6 +49,7 @@ protected:
+         CONT_NONE            = 0,
+         CONT_EMPTY           = 1,
+         CONT_PID             = 2,
++        CONT_ADAPTIVE        = 3,
+     };            // controller that should be used     
+ 
+     enum class  CustomControlOption {
+diff --git a/libraries/AC_CustomControl/AC_CustomControl_Adaptive.cpp b/libraries/AC_CustomControl/AC_CustomControl_Adaptive.cpp
+new file mode 100644
+index 0000000000..549ec62fa9
+--- /dev/null
++++ b/libraries/AC_CustomControl/AC_CustomControl_Adaptive.cpp
+@@ -0,0 +1,198 @@
++#include "AC_CustomControl_config.h"
++
++#if AP_CUSTOMCONTROL_ADAPTIVE_ENABLED
++
++#include "AC_CustomControl_Adaptive.h"
++
++#include <GCS_MAVLink/GCS.h>
++
++// table of user settable parameters
++const AP_Param::GroupInfo AC_CustomControl_Adaptive::var_info[] = {
++    // @Param: AH_MIN_R
++    // @DisplayName: AH_MIN_R
++    // @Description: Min inertial estimation for roll angle, must be positive
++    // @User: Advanced
++    AP_GROUPINFO("AH_MIN_R", 1, AC_CustomControl_Adaptive, ah_min_r, 0.01F),
++
++    // @Param: AH_MIN_P
++    // @DisplayName: AH_MIN_P
++    // @Description: Min inertial estimation for pitch angle, must be positive
++    // @User: Advanced
++    AP_GROUPINFO("AH_MIN_P", 2, AC_CustomControl_Adaptive, ah_min_p, 0.01F),
++
++    // @Param: AH_MIN_Y
++    // @DisplayName: AH_MIN_Y
++    // @Description: Min inertial estimation for yaw angle, must be positive
++    // @User: Advanced
++    AP_GROUPINFO("AH_MIN_Y", 3, AC_CustomControl_Adaptive, ah_min_y, 0.01F),
++
++    // @Param: AH_MAX_R
++    // @DisplayName: AH_MAX_R
++    // @Description: Max inertial estimation for roll angle, must be positive
++    // @User: Advanced
++    AP_GROUPINFO("AH_MAX_R", 4, AC_CustomControl_Adaptive, ah_max_r, 0.1F),
++
++    // @Param: AH_MAX_P
++    // @DisplayName: AH_MAX_P
++    // @Description: Max inertial estimation for pitch angle, must be positive
++    // @User: Advanced
++    AP_GROUPINFO("AH_MAX_P", 5, AC_CustomControl_Adaptive, ah_max_p, 0.1F),
++
++    // @Param: AH_MAX_Y
++    // @DisplayName: AH_MAX_Y
++    // @Description: Max inertial estimation for yaw angle, must be positive
++    // @User: Advanced
++    AP_GROUPINFO("AH_MAX_Y", 6, AC_CustomControl_Adaptive, ah_max_y, 0.1F),
++
++    // @Param: L_SLIDING_R
++    // @DisplayName: L_SLIDING_R
++    // @Description: Lambda gain for x rate sliding surface
++    // @User: Advanced
++    AP_GROUPINFO("L_SLIDING_R", 7, AC_CustomControl_Adaptive, lambda_sr, 0.87F),
++
++    // @Param: L_SLIDING_P
++    // @DisplayName: L_SLIDING_P
++    // @Description: Lambda gain for y rate sliding surface
++    // @User: Advanced
++    AP_GROUPINFO("L_SLIDING_P", 8, AC_CustomControl_Adaptive, lambda_sp, 0.73F),
++
++    // @Param: L_SLIDING_Y
++    // @DisplayName: L_SLIDING_Y
++    // @Description: Lambda gain for z rate sliding surface
++    // @User: Advanced
++    AP_GROUPINFO("L_SLIDING_Y", 9, AC_CustomControl_Adaptive, lambda_sy, 0.45F),
++
++    // @Param: K_ROLL
++    // @DisplayName: K_ROLL
++    // @Description: K gain for Roll controller
++    // @User: Advanced
++    AP_GROUPINFO("K_ROLL", 10, AC_CustomControl_Adaptive, k1, 0.045F),
++
++    // @Param: K_PITCH
++    // @DisplayName: K_PITCH
++    // @Description: K gain for Pitch controller
++    // @User: Advanced
++    AP_GROUPINFO("K_PITCH", 11, AC_CustomControl_Adaptive, k2, 0.045F),
++
++    // @Param: K_YAW
++    // @DisplayName: K_YAW
++    // @Description: K gain for Yaw controller
++    // @User: Advanced
++    AP_GROUPINFO("K_YAW", 12, AC_CustomControl_Adaptive, k3, 0.023F),
++
++    // @Param: P_ROLL
++    // @DisplayName: P_ROLL
++    // @Description: P roll adaptive gain
++    // @User: Advanced
++    AP_GROUPINFO("P_ROLL", 13, AC_CustomControl_Adaptive, P_11, 0.08F),
++
++    // @Param: P_PITCH
++    // @DisplayName: P_PITCH
++    // @Description: P pitch adaptive gain
++    // @User: Advanced
++    AP_GROUPINFO("P_PITCH", 14, AC_CustomControl_Adaptive, P_22, 0.08F),
++
++    // @Param: P_YAW
++    // @DisplayName: P_YAW
++    // @Description: P yaw adaptive gain
++    // @User: Advanced
++    AP_GROUPINFO("P_YAW", 15, AC_CustomControl_Adaptive, P_33, 0.05F),
++
++    // @Param: GUESS_R
++    // @DisplayName: GUESS_R
++    // @Description: Initial guess for roll intertia
++    // @User: Advanced
++    AP_GROUPINFO("GUESS_R", 16, AC_CustomControl_Adaptive, ah_guess_r, 0.03F),
++
++    // @Param: GUESS_P
++    // @DisplayName: GUESS_P
++    // @Description: Initial guess for pitch intertia
++    // @User: Advanced
++    AP_GROUPINFO("GUESS_P", 17, AC_CustomControl_Adaptive, ah_guess_p, 0.02F),
++
++    // @Param: GUESS_Y
++    // @DisplayName: GUESS_Y
++    // @Description: Initial guess for yaw intertia
++    // @User: Advanced
++    AP_GROUPINFO("GUESS_Y", 18, AC_CustomControl_Adaptive, ah_guess_y, 0.01F),
++
++    AP_GROUPEND
++};
++
++// initialize in the constructor
++AC_CustomControl_Adaptive::AC_CustomControl_Adaptive(
++    AC_CustomControl &frontend,
++    AP_AHRS_View*& ahrs,
++    AC_AttitudeControl*& att_control,
++    AP_MotorsMulticopter*& motors,
++    float dt) :
++    AC_CustomControl_Backend(frontend, ahrs, att_control, motors, dt)
++{
++    _dt = dt;
++    AP_Param::setup_object_defaults(this, var_info);
++
++    Vector3f guesses{ah_guess_r.get(), ah_guess_p.get(), ah_guess_y.get()};
++    adaptive_controller.initialize(guesses);
++}
++
++// update controller
++// return roll, pitch, yaw controller output
++Vector3f AC_CustomControl_Adaptive::update(void)
++{
++    // reset controller based on spool state
++    switch (_motors->get_spool_state()) {
++    case AP_Motors::SpoolState::SHUT_DOWN:
++    case AP_Motors::SpoolState::GROUND_IDLE:
++        // We are still at the ground. Reset custom controller to avoid
++        // build up, ex: integrator
++        reset();
++        break;
++
++    case AP_Motors::SpoolState::THROTTLE_UNLIMITED:
++    case AP_Motors::SpoolState::SPOOLING_UP:
++    case AP_Motors::SpoolState::SPOOLING_DOWN:
++        // we are off the ground
++        break;
++    }
++
++    // run custom controller after here
++    Quaternion attitude_body, attitude_target;
++    _ahrs->get_quat_body_to_ned(attitude_body);
++
++    attitude_target = _att_control->get_attitude_target_quat();
++
++
++    Vector3f attitude_error;
++    float _thrust_angle, _thrust_error_angle;
++    _att_control->thrust_heading_rotation_angles(attitude_target, attitude_body, attitude_error,
++            _thrust_angle, _thrust_error_angle);
++
++    Quaternion rotation_target_to_body = attitude_body.inverse() * attitude_target;
++    Vector3f ang_vel_body_feedforward = rotation_target_to_body * _att_control->get_attitude_target_ang_vel();
++
++    Vector3f target_rate;
++    target_rate[0] = ang_vel_body_feedforward[0];
++    target_rate[1] = ang_vel_body_feedforward[1];
++    target_rate[2] = ang_vel_body_feedforward[2];
++
++    Vector3f ah_min{ah_min_r.get(), ah_min_p.get(), ah_min_y.get()};
++    Vector3f ah_max{ah_max_r.get(), ah_max_p.get(), ah_max_y.get()};
++    Vector3f lambdas_sliding{lambda_sr.get(), lambda_sp.get(), lambda_sy.get()};
++    Vector3f kd_gains{k1.get(), k2.get(), k3.get()};
++    Vector3f p_gains{P_11.get(), P_22.get(), P_33.get()};
++    Vector3f gyro_latest = _ahrs->get_gyro_latest();
++    Vector3f motor_out;
++
++    adaptive_controller.step(target_rate, gyro_latest, motor_out, attitude_error, _dt, ah_min, ah_max, lambdas_sliding, kd_gains, p_gains);
++
++    // return what arducopter main controller outputted
++    return motor_out;
++}
++
++// reset controller to avoid build up on the ground
++// or to provide bumpless transfer from arducopter main controller
++void AC_CustomControl_Adaptive::reset(void)
++{
++}
++
++#endif  // AP_CUSTOMCONTROL_Adaptive_ENABLED
+diff --git a/libraries/AC_CustomControl/AC_CustomControl_Adaptive.h b/libraries/AC_CustomControl/AC_CustomControl_Adaptive.h
+new file mode 100644
+index 0000000000..30ac68b312
+--- /dev/null
++++ b/libraries/AC_CustomControl/AC_CustomControl_Adaptive.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include "AC_CustomControl_config.h"
++
++#if AP_CUSTOMCONTROL_ADAPTIVE_ENABLED
++
++#include "AC_CustomControl_Backend.h"
++#include <AC_CustomControl_Adaptive/Custom_Att_Controller.h>
++
++class AC_CustomControl_Adaptive : public AC_CustomControl_Backend
++{
++public:
++    AC_CustomControl_Adaptive(
++        AC_CustomControl &frontend,
++        AP_AHRS_View*& ahrs,
++        AC_AttitudeControl*& att_control,
++        AP_MotorsMulticopter*& motors,
++        float dt);
++
++    Vector3f update(void) override;
++    void reset(void) override;
++
++    Custom_Att_Controller adaptive_controller;
++    // user settable parameters
++    static const struct AP_Param::GroupInfo var_info[];
++
++protected:
++    // declare parameters here
++    float _dt;
++    AP_Float lambda_pm, lambda_qm, lambda_rm;
++    AP_Float lambda_sr, lambda_sp, lambda_sy;
++    AP_Float k1, k2, k3;
++    AP_Float P_11, P_22, P_33;
++    AP_Float ah_guess_r, ah_guess_p, ah_guess_y;
++    AP_Float ah_min_r, ah_min_p, ah_min_y;
++    AP_Float ah_max_r, ah_max_p, ah_max_y;
++};
++
++#endif  // AP_CUSTOMCONTROL_EMPTY_ENABLED
+diff --git a/libraries/AC_CustomControl/AC_CustomControl_config.h b/libraries/AC_CustomControl/AC_CustomControl_config.h
+index 368b0b3233..15bcf79fcf 100644
+--- a/libraries/AC_CustomControl/AC_CustomControl_config.h
++++ b/libraries/AC_CustomControl/AC_CustomControl_config.h
+@@ -19,3 +19,7 @@
+ #ifndef AP_CUSTOMCONTROL_PID_ENABLED
+ #define AP_CUSTOMCONTROL_PID_ENABLED AP_CUSTOMCONTROL_BACKEND_DEFAULT_ENABLED
+ #endif
++
++#ifndef AP_CUSTOMCONTROL_ADAPTIVE_ENABLED
++#define AP_CUSTOMCONTROL_ADAPTIVE_ENABLED AP_CUSTOMCONTROL_BACKEND_DEFAULT_ENABLED
++#endif
+\ No newline at end of file
+diff --git a/libraries/AC_CustomControl/LogStructure.h b/libraries/AC_CustomControl/LogStructure.h
+new file mode 100644
+index 0000000000..3369e2e524
+--- /dev/null
++++ b/libraries/AC_CustomControl/LogStructure.h
+@@ -0,0 +1,95 @@
++#pragma once
++
++#include <AP_Logger/LogStructure.h>
++#include <AC_CustomControl/AC_CustomControl_config.h>
++
++#define LOG_DATA_FROM_CC \
++    LOG_CC0_MSG, \
++    LOG_CC1_MSG, \
++    LOG_CC2_MSG, \
++    LOG_CC3_MSG
++
++#if AP_CUSTOMCONTROL_ADAPTIVE_ENABLED
++
++// @LoggerMessage: CC0
++
++struct PACKED log_CC0 {
++    LOG_PACKET_HEADER;
++    uint64_t time_us;
++    float u_roll;
++    float u_pitch;
++    float u_yaw;
++    float control_r;
++    float control_p;
++    float control_y;
++    float adapt_r;
++    float adapt_p;
++    float adapt_y;
++    float err1;
++    float err2;
++    float err3;
++};
++
++// @LoggerMessage: CC1
++
++struct PACKED log_CC1 {
++    LOG_PACKET_HEADER;
++    uint64_t time_us;
++    float wr1;
++    float wr2;
++    float wr3;
++    float dwr1;
++    float dwr2;
++    float dwr3;
++    float wm1;
++    float wm2;
++    float wm3;
++    float dwm1;
++    float dwm2;
++    float dwm3;
++};
++
++// @LoggerMessage: CC2
++
++struct PACKED log_CC2 {
++    LOG_PACKET_HEADER;
++    uint64_t time_us;
++    float w1;
++    float w2;
++    float w3;
++    float wd1;
++    float wd2;
++    float wd3;
++    float s_roll;
++    float s_pitch;
++    float s_yaw;
++};
++
++// @LoggerMessage: CC3
++
++struct PACKED log_CC3 {
++    LOG_PACKET_HEADER;
++    uint64_t time_us;
++    float ah1;
++    float ah2;
++    float ah3;
++    float dah1;
++    float dah2;
++    float dah3;
++    float ys1;
++    float ys2;
++    float ys3;
++};
++
++#define LOG_STRUCTURE_FROM_CC \
++    { LOG_CC0_MSG, sizeof(log_CC0), \
++        "CCL0", "Qffffffffffff", "TimeUS,U1,U2,U3,c_r,c_p,c_y,ad_r,ad_p,ad_y,e1,e2,e3", "s------------", "F------------" , true}, \
++    { LOG_CC1_MSG, sizeof(log_CC1), \
++        "CCL1", "Qffffffffffff", "TimeUS,wr1,wr2,wr3,dwr1,dwr2,dwr3,wm1,wm2,wm3,dwm1,dwm2,dwm3", "s------------", "F------------", true}, \
++    { LOG_CC2_MSG, sizeof(log_CC2), \
++        "CCL2", "Qfffffffff", "TimeUS,w1,w2,w3,wd1,wd2,wd3,s1,s2,s3", "s---------", "F---------", true}, \
++    { LOG_CC3_MSG, sizeof(log_CC3), \
++        "CCL3", "Qfffffffff", "TimeUS,ah1,ah2,ah3,dah1,dah2,dah3,ys1,ys2,ys3", "s---------", "F---------", true},
++#else
++#define LOG_STRUCTURE_FROM_CC
++#endif
+\ No newline at end of file
+diff --git a/libraries/AC_CustomControl_Adaptive/Custom_Att_Controller.cpp b/libraries/AC_CustomControl_Adaptive/Custom_Att_Controller.cpp
+new file mode 100644
+index 0000000000..ea526c7d79
+--- /dev/null
++++ b/libraries/AC_CustomControl_Adaptive/Custom_Att_Controller.cpp
+@@ -0,0 +1,194 @@
++#include "Custom_Att_Controller.h"
++
++void Custom_Att_Controller::Log_CC0(Vector3f U, Vector3f control, Vector3f adapt, Vector3f error) const
++{
++    struct log_CC0 pkt = {
++        LOG_PACKET_HEADER_INIT(LOG_CC0_MSG),
++time_us     : AP_HAL::micros64(),
++u_roll      : U.x,
++u_pitch     : U.y,
++u_yaw       : U.z,
++control_r   : control.x,
++control_p   : control.y,
++control_y   : control.z,
++adapt_r     : adapt.x,
++adapt_p     : adapt.y,
++adapt_y     : adapt.z,
++err1        : degrees(error.x),
++err2        : degrees(error.y),
++err3        : degrees(error.z)
++    };
++    AP::logger().WriteBlock(&pkt, sizeof(pkt));
++}
++
++void Custom_Att_Controller::Log_CC1(Vector3f wr, Vector3f dwr, Vector3f w_m, Vector3f d_wm) const
++{
++    struct log_CC1 pkt = {
++        LOG_PACKET_HEADER_INIT(LOG_CC1_MSG),
++time_us     : AP_HAL::micros64(),
++wr1         : degrees(wr.x),
++wr2         : degrees(wr.y),
++wr3         : degrees(wr.z),
++dwr1        : degrees(dwr.x),
++dwr2        : degrees(dwr.y),
++dwr3        : degrees(dwr.z),
++wm1         : degrees(w_m.x),
++wm2         : degrees(w_m.y),
++wm3         : degrees(w_m.z),
++dwm1        : degrees(d_wm.x),
++dwm2        : degrees(d_wm.y),
++dwm3        : degrees(d_wm.z)
++    };
++    AP::logger().WriteBlock(&pkt, sizeof(pkt));
++}
++
++void Custom_Att_Controller::Log_CC2(Vector3f w_, Vector3f wd, Vector3f s_) const
++{
++    struct log_CC2 pkt = {
++        LOG_PACKET_HEADER_INIT(LOG_CC2_MSG),
++time_us     : AP_HAL::micros64(),
++w1          : degrees(w_.x),
++w2          : degrees(w_.y),
++w3          : degrees(w_.z),
++wd1         : degrees(wd.x),
++wd2         : degrees(wd.y),
++wd3         : degrees(wd.z),
++s_roll      : degrees(s_.x),
++s_pitch     : degrees(s_.y),
++s_yaw       : degrees(s_.z)
++    };
++    AP::logger().WriteBlock(&pkt, sizeof(pkt));
++}
++
++void Custom_Att_Controller::Log_CC3(Vector3f ah, Vector3f dah, Vector3f ys_) const
++{
++    struct log_CC3 pkt = {
++        LOG_PACKET_HEADER_INIT(LOG_CC3_MSG),
++time_us     : AP_HAL::micros64(),
++ah1         : ah.x,
++ah2         : ah.y,
++ah3         : ah.z,
++dah1        : dah.x,
++dah2        : dah.y,
++dah3        : dah.z,
++ys1         : ys_.x,
++ys2         : ys_.y,
++ys3         : ys_.z
++    };
++    AP::logger().WriteBlock(&pkt, sizeof(pkt));
++}
++
++float Custom_Att_Controller::param_projection(float ahat, float dahat, float ahat_min, float ahat_max)
++{
++    if (ahat >= ahat_max && dahat > 0.0F) {
++        return 0.0F;
++    } else if (ahat <= ahat_min && dahat < 0.0F) {
++        return 0.0F;
++    } else {
++        return dahat;
++    }
++}
++
++void Custom_Att_Controller::step(
++    Vector3f w_d, Vector3f w, Vector3f &U, Vector3f att_error, float dt, Vector3f ah_min,
++    Vector3f ah_max, Vector3f lambdas_sliding, Vector3f kd_gains, Vector3f p_gains)
++{
++    Y.zero();
++
++    // Create acceleration raw ref based on filtered speed reference
++    Vector3f raw_dw_d;
++
++    if (dt > 0.0F) {
++        raw_dw_d = (w_d - wd_prev) / dt;
++    } else {
++        raw_dw_d.zero();
++    }
++
++    // Update previous speed reference
++    wd_prev = w_d;
++
++    // Generate filtered acceleration reference
++    Vector3f dw_d = target_accel.apply(raw_dw_d, dt);
++
++    // Virtual controller reference, includes velocity and attitude targets
++    // xr = x_d + (lambda * error);
++    Vector3f ls_att = att_error;
++    ls_att *= lambdas_sliding;
++    w_r = w_d + ls_att;
++
++    // Desired - Actual to match ArduPilot's logic
++    s = w_r - w;
++
++    // Derivate of the virtual controller reference
++    // dxr = dx_d + (lambda * d_error);
++    Vector3f ls_diff = w_d - w;
++    ls_diff *= lambdas_sliding;
++    dw_r = dw_d + ls_diff;
++
++    // Populate Y matrix
++    Y.a.x = dw_r.x;
++    Y.a.y = -(w.y * w.z);
++    Y.a.z = w.y * w.z;
++
++    Y.b.x = w.x * w.z;
++    Y.b.y = dw_r.y;
++    Y.b.z = -(w.x * w.z);
++
++    Y.c.x = -(w.x * w.y);
++    Y.c.y = w.x * w.y;
++    Y.c.z = dw_r.z;
++
++    // Adaptation contribution
++    adaptation = Y * a_hat;
++
++    // Controller contribution Kd * s
++    controller = s;
++    controller *= kd_gains;
++
++    // Control output
++    U = adaptation + controller;
++
++    // Adaptation law
++    // da_hat = P*Y(t)*s
++    ys = Y.transposed() * s;
++    da_hat = ys;
++    da_hat *= p_gains;
++
++    // Apply param projection to stop adaptation if not necessary
++    da_hat.x = param_projection(a_hat.x, da_hat.x, ah_min.x, ah_max.x);
++    da_hat.y = param_projection(a_hat.y, da_hat.y, ah_min.y, ah_max.y);
++    da_hat.z = param_projection(a_hat.z, da_hat.z, ah_min.z, ah_max.z);
++
++    // Update adaptation
++    a_hat += da_hat * dt;
++    a_hat.x = constrain_float(a_hat.x, ah_min.x, ah_max.x);
++    a_hat.y = constrain_float(a_hat.y, ah_min.y, ah_max.y);
++    a_hat.z = constrain_float(a_hat.z, ah_min.z, ah_max.z);
++
++    // Log debug variables
++    Log_CC0(U, controller, adaptation, att_error);
++    Log_CC1(w_r, dw_r, w_r, dw_r);
++    Log_CC2(w, w_d, s);
++    Log_CC3(a_hat, da_hat, ys);
++}
++
++void Custom_Att_Controller::initialize(Vector3f guesses)
++{
++    w_r.zero();
++    dw_r.zero();
++    s.zero();
++    Y.zero();
++    wd_prev.zero();
++    target_accel.set_cutoff_frequency(10.0F);
++    a_hat.x = guesses.x;
++    a_hat.y = guesses.y;
++    a_hat.z = guesses.z;
++    da_hat.zero();
++    controller.zero();
++    adaptation.zero();
++}
++
++// Constructor
++Custom_Att_Controller::Custom_Att_Controller() {}
++
++Custom_Att_Controller::~Custom_Att_Controller() = default;
+\ No newline at end of file
+diff --git a/libraries/AC_CustomControl_Adaptive/Custom_Att_Controller.h b/libraries/AC_CustomControl_Adaptive/Custom_Att_Controller.h
+new file mode 100644
+index 0000000000..191f78cd92
+--- /dev/null
++++ b/libraries/AC_CustomControl_Adaptive/Custom_Att_Controller.h
+@@ -0,0 +1,54 @@
++#pragma once
++#include <cmath>
++#include <AP_Logger/AP_Logger.h>
++#include <Filter/LowPassFilter.h>
++// Class declaration for model Custom_Att_Controller
++class Custom_Att_Controller final
++{
++    // public data and function members
++public:
++    // Copy Constructor
++    Custom_Att_Controller(Custom_Att_Controller const&) = delete;
++
++    // Assignment Operator
++    Custom_Att_Controller& operator= (Custom_Att_Controller const&) & = delete;
++
++    // Move Constructor
++    Custom_Att_Controller(Custom_Att_Controller &&) = delete;
++
++    // Move Assignment Operator
++    Custom_Att_Controller& operator= (Custom_Att_Controller &&) = delete;
++
++    // Controller initialization
++    void initialize(Vector3f guesses);
++
++    // Controller step function
++    void step(Vector3f w_d, Vector3f w, Vector3f &U, Vector3f att_error, float dt, Vector3f ah_min,
++              Vector3f ah_max, Vector3f lambdas_sliding, Vector3f kd_gains, Vector3f p_gains);
++
++    void Log_CC0(Vector3f U, Vector3f controller, Vector3f adaptation, Vector3f att_error) const;
++
++    void Log_CC1(Vector3f wr, Vector3f d_wr, Vector3f wm, Vector3f dwm) const;
++
++    void Log_CC2(Vector3f w, Vector3f wd, Vector3f s) const;
++
++    void Log_CC3(Vector3f ah, Vector3f dah, Vector3f ys) const;
++
++    float param_projection(float a_hat, float da_hat, float ahat_min, float ahat_max);
++
++    // Constructor
++    Custom_Att_Controller();
++
++    // Destructor
++    ~Custom_Att_Controller();
++
++    // private data and function members
++private:
++    Vector3f ys, a_hat, da_hat;
++    Vector3f w_r, dw_r;
++    Vector3f s;
++    Vector3f controller, adaptation;
++    Vector3f wd_prev;
++    LowPassFilterVector3f target_accel;
++    Matrix3f Y;
++};
+\ No newline at end of file
+diff --git a/libraries/AP_Logger/LogStructure.h b/libraries/AP_Logger/LogStructure.h
+index ccaab58783..56c5f404d5 100644
+--- a/libraries/AP_Logger/LogStructure.h
++++ b/libraries/AP_Logger/LogStructure.h
+@@ -148,6 +148,7 @@ const struct MultiplierStructure log_Multipliers[] = {
+ #include <AC_AttitudeControl/LogStructure.h>
+ #include <AP_HAL/LogStructure.h>
+ #include <AP_Mission/LogStructure.h>
++#include <AC_CustomControl/LogStructure.h>
+ 
+ // structure used to define logging format
+ // It is packed on ChibiOS to save flash space; however, this causes problems
+@@ -1247,6 +1248,7 @@ LOG_STRUCTURE_FROM_AHRS \
+ LOG_STRUCTURE_FROM_HAL_CHIBIOS \
+ LOG_STRUCTURE_FROM_HAL \
+ LOG_STRUCTURE_FROM_RPM \
++LOG_STRUCTURE_FROM_CC \
+ LOG_STRUCTURE_FROM_FENCE \
+     { LOG_DF_FILE_STATS, sizeof(log_DSF), \
+       "DSF", "QIHIIII", "TimeUS,Dp,Blk,Bytes,FMn,FMx,FAv", "s--b---", "F--0---" }, \
+@@ -1281,7 +1283,6 @@ LOG_STRUCTURE_FROM_AIS \
+       "VER",   "QBHBBBBIZHBB", "TimeUS,BT,BST,Maj,Min,Pat,FWT,GH,FWS,APJ,BU,FV", "s-----------", "F-----------", false }, \
+     { LOG_MOTBATT_MSG, sizeof(log_MotBatt), \
+       "MOTB", "QfffffB",  "TimeUS,LiftMax,BatVolt,ThLimit,ThrAvMx,ThrOut,FailFlags", "s------", "F------" , true }
+-
+ // message types 0 to 31 reserved for vehicle-specific use
+ 
+ // message types for common messages
+@@ -1368,6 +1369,7 @@ enum LogMessages : uint8_t {
+     LOG_RCOUT3_MSG,
+     LOG_IDS_FROM_FENCE,
+     LOG_IDS_FROM_HAL,
++    LOG_DATA_FROM_CC,
+ 
+     _LOG_LAST_MSG_
+ };
